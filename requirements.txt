@@ -1,0 +1,11 @@
+firebase-admin
+google-cloud-storage
+python-dotenv
+PyQt5==5.15.9
+qtawesome
+requests
+pyaudio
+aiortc
+av
+aiohttp
+qasync

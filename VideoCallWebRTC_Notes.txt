@@ -1,0 +1,226 @@
+GHI CHÚ VIDEO CALL (WebRTC với aiortc + aiohttp) VÀ LƯU Ý ỔN ĐỊNH
+================================================================
+
+1. KIẾN TRÚC CƠ BẢN VIDEO CALL 1–1
+----------------------------------
+
+- Media/WebRTC: dùng aiortc (RTCPeerConnection) để:
+  - Lấy camera/mic từ client (OpenCV / MediaStreamTrack).
+  - Gửi/nhận audio/video qua kết nối P2P (hoặc qua TURN nếu cần).
+
+- Signaling (trao đổi SDP/ICE):
+  - Phase 1: dùng TCP server sẵn có để báo cuộc gọi:
+    - CALL_INVITE, CALL_INCOMING, CALL_ACCEPT, CALL_REJECT, CALL_END.
+  - Phase 2: dùng Firebase Realtime Database (hoặc aiohttp server) để:
+    - Gửi Offer/Answer/ICE giữa 2 peer.
+    - Mỗi cuộc gọi có 1 callId, map tới 1 signalPath riêng (/webrtc_calls/{callId}).
+
+- UI:
+  - Cửa sổ chính (ChatWindow) quản lý state:
+    - current_call_id, current_call_peer_uid, current_call_signal_path, current_call_is_caller, video_call_window.
+  - Cửa sổ VideoCallWindow:
+    - Hiển thị preview local (OpenCV + QTimer).
+    - Khởi động aiortc + signaling SDP.
+
+
+2. LUỒNG VIDEO CALL CHUẨN
+-------------------------
+
+2.1. Caller (A) gọi Callee (B)
+------------------------------
+
+1) A bấm "Gọi video":
+   - Gửi CALL_INVITE { toUid: B } qua TCP.
+
+2) Server:
+   - Tạo callId (uuid).
+   - Lưu active_calls[callId] = { caller_uid: A, callee_uid: B, state: "ringing" }.
+   - Gửi về A: CALL_INVITE_SENT { ok: true, callId, signalPath: "/webrtc_calls/{callId}" }.
+   - Gửi cho B: CALL_INCOMING { callId, fromUid: A, signalPath }.
+
+3) Client A:
+   - Nhận CALL_INVITE_SENT:
+     - Lưu current_call_id, current_call_peer_uid, current_call_signal_path.
+     - Bật timer 30s (QTimer) để timeout nếu không có CALL_ACCEPTED/CALL_REJECTED.
+
+4) Client B:
+   - Nhận CALL_INCOMING:
+     - Nếu đang không có current_call_id:
+       - Hiện popup hỏi chấp nhận/ từ chối.
+       - Nếu Accept:
+         - Lưu state callId, peerUid, signalPath.
+         - Gửi CALL_ACCEPT { callId }.
+         - Mở VideoCallWindow (is_caller=False), gọi start_connection().
+       - Nếu Reject:
+         - Gửi CALL_REJECT { callId }.
+     - Nếu ĐANG có current_call_id (đang call / đang rung):
+       - Không hiện popup.
+       - Gửi CALL_REJECT { callId, reason: "busy" }.
+
+5) Server khi nhận CALL_ACCEPT:
+   - Đổi active_calls[callId].state = "active".
+   - Gửi A: CALL_ACCEPTED { callId, peerUid: B, signalPath }.
+   - Gửi B: CALL_ACCEPT_OK { ok: true, callId }.
+
+6) Client A:
+   - Nhận CALL_ACCEPTED:
+     - Dừng timer 30s.
+     - Cập nhật state current_call_id, peerUid, signalPath.
+     - Mở VideoCallWindow (is_caller=True), gọi start_connection().
+
+
+2.2. WebRTC SDP với aiortc + Firebase (Phase 2)
+-----------------------------------------------
+
+*Ở cả 2 phía, VideoCallWindow được khởi tạo với: callId, signalPath, my_uid, peer_uid, is_caller.*
+
+- Caller (VideoCallWindow.is_caller=True):
+  - Tạo RTCPeerConnection (nên truyền RTCConfiguration với STUN).
+  - createOffer() → setLocalDescription().
+  - Ghi Offer lên Firebase:
+    - PUT { sdp, type: "offer", from, to } vào FIREBASE_DB_URL + signalPath + "/offer.json".
+  - Poll Answer:
+    - GET .../answer.json mỗi 1s.
+    - Khi thấy { type: "answer" }:
+      - setRemoteDescription(Answer).
+
+- Callee (is_caller=False):
+  - Poll Offer:
+    - GET .../offer.json mỗi 1s.
+    - Khi thấy { type: "offer" }:
+      - setRemoteDescription(Offer).
+      - createAnswer() → setLocalDescription().
+      - PUT Answer { sdp, type: "answer", from, to } vào .../answer.json.
+
+
+3. CÁC LƯU Ý QUAN TRỌNG ĐỂ TRÁNH CRASH / ĐƠ UI
+----------------------------------------------
+
+3.1. Threading & UI (PyQt5)
+---------------------------
+
+- Tuyệt đối không cập nhật UI từ thread socket hoặc thread khác:
+  - Không gọi QMessageBox, setText, show(), v.v. trong QThread run().
+- Dùng pyqtSignal:
+  - NetworkWorker (QThread) chỉ emit signal (message_received).
+  - ChatWindow.connect_signals() nối signal đó với slot (handle_server_message) ở main thread.
+  - Mọi popup (QMessageBox) và cập nhật UI đều nằm trong ChatWindow hoặc QWidget khác (UI thread).
+
+
+3.2. Camera & OpenCV
+--------------------
+
+- Khi mở VideoCallWindow:
+  - cap = cv2.VideoCapture(0).
+  - Dùng QTimer để đọc frame định kỳ:
+    - if not cap.isOpened() hoặc ret=False: return, không crash.
+- Khi đóng cửa sổ:
+  - Dừng timer trước (timer.stop()).
+  - Kiểm tra cap.isOpened() rồi cap.release() trong try/except.
+- Nếu chạy nhiều client trên cùng máy:
+  - Camera có thể bị "busy" → OpenCV log cảnh báo can't grab frame; đây không phải lỗi logic, chỉ cần UI không crash là được.
+
+
+3.3. Đóng RTCPeerConnection an toàn
+-----------------------------------
+
+- Trong closeEvent của VideoCallWindow:
+  - Lấy loop = asyncio.get_event_loop().
+  - Nếu loop.is_running():
+    - loop.create_task(pc.close()).
+  - Nếu không:
+    - loop.run_until_complete(pc.close()).
+- Bọc trong try/except để tránh crash nếu loop chưa sẵn sàng.
+
+
+3.4. Call Collision (Hai bên cùng gọi)
+--------------------------------------
+
+- Khi CALL_INCOMING tới client:
+  - Nếu current_call_id != None (đang ringing hoặc đang call):
+    - Gửi CALL_REJECT { callId, reason: "busy" }.
+    - Không hiện popup hỏi.
+- Khi CALL_REJECTED phía caller:
+  - Đọc data.reason:
+    - reason == "busy" → hiển thị "Người dùng đang bận trong cuộc gọi khác."
+    - trường hợp khác → "Người dùng đã từ chối cuộc gọi."
+
+
+3.5. Timeout – Không chờ đợi mãi mãi
+------------------------------------
+
+- Ringing timeout (caller):
+  - Sau khi nhận CALL_INVITE_SENT, bật QTimer 30s.
+  - Nếu chưa có CALL_ACCEPTED/CALL_REJECTED khi timeout:
+    - Gửi CALL_END { callId }.
+    - Hiển thị "Không ai bắt máy.".
+    - Reset state cuộc gọi.
+
+- SDP timeout (aiortc + Firebase):
+  - Trong _do_callee_flow và _wait_for_answer, không nên while self.running vô hạn:
+    - Đặt giới hạn số lần retry hoặc thời gian tối đa (ví dụ 15–20s).
+    - Nếu hết thời gian:
+      - Hiển thị "Connection timeout" trong remote_label.
+      - Đóng VideoCallWindow (close()) từ UI thread.
+
+
+3.6. Dọn rác trên Firebase (Data Hygiene)
+-----------------------------------------
+
+- Trước khi PUT Offer mới:
+  - DELETE các node cũ để tránh đọc nhầm Offer/Answer cũ:
+    - DELETE FIREBASE_DB_URL + signalPath + "/offer.json".
+    - DELETE FIREBASE_DB_URL + signalPath + "/answer.json".
+- Sau khi cuộc gọi kết thúc (cả 2 bên):
+  - Có thể dọn luôn /webrtc_calls/{callId} nếu muốn sạch DB.
+
+
+3.7. Cấu hình STUN / ICE cho aiortc
+-----------------------------------
+
+- Để WebRTC vượt NAT tốt hơn (demo khác mạng LAN):
+  - Dùng RTCConfiguration với STUN:
+
+    from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection
+
+    config = RTCConfiguration(iceServers=[
+        RTCIceServer(urls=["stun:stun.l.google.com:19302"])
+    ])
+    pc = RTCPeerConnection(configuration=config)
+
+- Nếu cần hỗ trợ thực tế ngoài internet, nên cân nhắc thêm TURN server.
+
+
+4. EVENT LOOP HYBRID: Qt + asyncio (qasync)
+-------------------------------------------
+
+- Thay vì app.exec_(), dùng qasync.QEventLoop(app):
+
+    app = QApplication(sys.argv)
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
+    main_window = MainWindow()
+    main_window.show()
+
+    with loop:
+        loop.run_forever()
+
+- Điều này cho phép:
+  - UI Qt xử lý mượt.
+  - Các coroutine aiortc / requests.async chạy trong cùng event loop.
+  - Tránh đụng độ giữa app.exec_() và asyncio.run().
+
+
+5. TỔNG KẾT ĐỂ GỌI MƯỢT, KHÔNG CRASH
+------------------------------------
+
+- Không chạm UI từ thread socket hoặc thread nền → luôn dùng signal/slot.
+- Dừng timer, release camera và đóng RTCPeerConnection trong closeEvent, có try/except.
+- Xử lý call collision bằng state current_call_id + reason "busy".
+- Thêm timeout hợp lý cho ringing (CALL_INVITE) và SDP (Offer/Answer).
+- Dọn rác Firebase trước/sau mỗi cuộc gọi để tránh dữ liệu cũ.
+- Dùng qasync làm event loop hybrid cho Qt + asyncio.
+- Test trước trên LAN với 2 máy/2 client, sau đó mới test kịch bản internet (NAT, 4G, Wifi). 
+
+
