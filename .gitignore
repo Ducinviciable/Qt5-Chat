@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+.venv/
+env.*
+.env
+
+lib/firebase-service.json
+
+# IDE/cursor artifacts
+.cursor/
+.idea/
+.vscode/
+
